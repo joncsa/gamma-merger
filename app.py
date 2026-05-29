@@ -23,7 +23,7 @@ def download_file(url, dest_path):
         f.write(response.content)
 
 def merge_pptx_files(pptx_paths, output_path):
-    """Merge multiple PPTX files into one using python-pptx."""
+    """Merge multiple PPTX files into one using python-pptx, sequentially."""
     if len(pptx_paths) == 1:
         shutil.copy(pptx_paths[0], output_path)
         return
@@ -34,29 +34,22 @@ def merge_pptx_files(pptx_paths, output_path):
     for pptx_path in pptx_paths[1:]:
         src_prs = Presentation(pptx_path)
 
-        # Match slide dimensions from base
         for slide in src_prs.slides:
-            # Find a matching layout or use blank
             blank_layout = base_prs.slide_layouts[6] if len(base_prs.slide_layouts) > 6 else base_prs.slide_layouts[0]
             new_slide = base_prs.slides.add_slide(blank_layout)
 
-            # Remove any default placeholder shapes added by the layout
             for shape in list(new_slide.placeholders):
                 sp = shape._element
                 sp.getparent().remove(sp)
 
-            # Deep copy all shapes from source slide
             for shape in slide.shapes:
                 el_copy = copy.deepcopy(shape._element)
                 new_slide.shapes._spTree.append(el_copy)
 
-            # Copy slide background if present
-            if slide.background.fill.type is not None:
-                try:
-                    bg = new_slide.background
-                    bg.fill.background()
-                except Exception:
-                    pass
+        # Save after each merge and reload to free memory
+        base_prs.save(output_path)
+        del src_prs
+        base_prs = Presentation(output_path)
 
     base_prs.save(output_path)
 
