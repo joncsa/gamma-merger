@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import requests
 import tempfile
@@ -8,6 +9,15 @@ from pptx import Presentation
 import copy
 
 app = Flask(__name__)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def sanitize_filename(name):
+    """Remove characters invalid in OneDrive filenames and Graph API URLs."""
+    name = re.sub(r'[<>:"/\\|?*&]', '-', name)
+    name = re.sub(r'-+', '-', name)
+    return name.strip('-')
+
 
 # ── OneDrive helpers ──────────────────────────────────────────────────────────
 
@@ -74,8 +84,8 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
     with open(file_path, 'rb') as f:
         while uploaded < file_size:
             chunk = f.read(CHUNK_SIZE)
-            chunk_len   = len(chunk)
-            range_end   = uploaded + chunk_len - 1
+            chunk_len     = len(chunk)
+            range_end     = uploaded + chunk_len - 1
             content_range = f'bytes {uploaded}-{range_end}/{file_size}'
 
             chunk_response = requests.put(
@@ -224,8 +234,8 @@ def merge_and_upload():
     if not data:
         return jsonify({'error': 'No JSON body provided'}), 400
 
-    urls     = data.get('urls', [])
-    filename = data.get('filename', 'merged_presentation.pptx')
+    urls      = data.get('urls', [])
+    raw_name  = data.get('filename', 'merged_presentation.pptx')
     folder_id = os.environ.get('ONEDRIVE_FOLDER_ID', '')
 
     if not urls:
@@ -233,7 +243,8 @@ def merge_and_upload():
     if not folder_id:
         return jsonify({'error': 'ONEDRIVE_FOLDER_ID environment variable not set'}), 500
 
-    # Ensure filename ends with .pptx
+    # Sanitize filename — remove characters invalid in OneDrive and Graph API URLs
+    filename = sanitize_filename(raw_name)
     if not filename.lower().endswith('.pptx'):
         filename += '.pptx'
 
