@@ -6,8 +6,6 @@ import tempfile
 import shutil
 from flask import Flask, request, jsonify, send_file
 from pptx import Presentation
-from pptx.util import Emu
-from lxml import etree
 import copy
 
 app = Flask(__name__)
@@ -24,7 +22,6 @@ def sanitize_filename(name):
 # ── OneDrive helpers ──────────────────────────────────────────────────────────
 
 def get_onedrive_access_token():
-    """Get a fresh OneDrive access token using the refresh token."""
     client_id     = os.environ['ONEDRIVE_CLIENT_ID']
     client_secret = os.environ['ONEDRIVE_CLIENT_SECRET']
     refresh_token = os.environ['ONEDRIVE_REFRESH_TOKEN']
@@ -42,19 +39,13 @@ def get_onedrive_access_token():
     )
     response.raise_for_status()
     token_data = response.json()
-
     if 'refresh_token' in token_data:
         os.environ['ONEDRIVE_REFRESH_TOKEN'] = token_data['refresh_token']
-
     return token_data['access_token']
 
 
 def upload_to_onedrive(file_path, filename, folder_id, access_token):
-    """
-    Upload a file to OneDrive using the resumable (chunked) upload session.
-    Returns the OneDrive web URL of the uploaded file.
-    """
-    CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB chunks
+    CHUNK_SIZE = 10 * 1024 * 1024
 
     create_session_url = (
         f'https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}:/{filename}:/createUploadSession'
@@ -81,7 +72,7 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
 
     with open(file_path, 'rb') as f:
         while uploaded < file_size:
-            chunk = f.read(CHUNK_SIZE)
+            chunk         = f.read(CHUNK_SIZE)
             chunk_len     = len(chunk)
             range_end     = uploaded + chunk_len - 1
             content_range = f'bytes {uploaded}-{range_end}/{file_size}'
@@ -95,10 +86,8 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
                 data=chunk,
                 timeout=120
             )
-
             if chunk_response.status_code not in (200, 201, 202):
                 chunk_response.raise_for_status()
-
             uploaded += chunk_len
 
     result = chunk_response.json()
@@ -108,18 +97,33 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
 # ── PPTX helpers ──────────────────────────────────────────────────────────────
 
 def download_file(url, dest_path):
-    """Download a file from URL, following redirects."""
     response = requests.get(url, allow_redirects=True, timeout=60)
     response.raise_for_status()
     with open(dest_path, 'wb') as f:
         f.write(response.content)
 
 
+def _rewrite_rids(element, rId_map):
+    """Recursively rewrite r:id, r:embed, r:link attributes using rId_map."""
+    rId_attrs = [
+        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id',
+        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
+        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link',
+    ]
+    for attr in rId_attrs:
+        if attr in element.attrib:
+            old = element.attrib[attr]
+            if old in rId_map:
+                element.attrib[attr] = rId_map[old]
+    for child in element:
+        _rewrite_rids(child, rId_map)
+
+
 def merge_pptx_files(pptx_paths, output_path):
     """
-    Merge multiple PPTX files into one using python-pptx.
-    Correctly copies image/media parts and remaps relationship IDs
-    so images are not broken in the merged output.
+    Merge multiple PPTX files preserving images.
+    Loads base from pptx_paths[0], appends all slides from subsequent files,
+    saves once at the end. No intermediate reload to avoid corruption.
     """
     if len(pptx_paths) == 1:
         shutil.copy(pptx_paths[0], output_path)
@@ -131,7 +135,7 @@ def merge_pptx_files(pptx_paths, output_path):
         src_prs = Presentation(pptx_path)
 
         for src_slide in src_prs.slides:
-            # Add a blank slide to the base presentation
+            # Add blank slide to base
             blank_layout = (
                 base_prs.slide_layouts[6]
                 if len(base_prs.slide_layouts) > 6
@@ -139,62 +143,38 @@ def merge_pptx_files(pptx_paths, output_path):
             )
             new_slide = base_prs.slides.add_slide(blank_layout)
 
-            # Remove any placeholder shapes from the blank layout
+            # Remove placeholder shapes from blank layout
             for shape in list(new_slide.placeholders):
                 sp = shape._element
                 sp.getparent().remove(sp)
 
-            # Build a rId remap: src rId → new rId in base_prs
+            # Copy all relationships from src slide → new slide, build rId map
             rId_map = {}
-
             for rId, rel in src_slide.part.rels.items():
-                if rel.is_external:
-                    # Copy external hyperlinks as-is
-                    new_rId = new_slide.part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+                try:
+                    if rel.is_external:
+                        new_rId = new_slide.part.relate_to(
+                            rel.target_ref, rel.reltype, is_external=True
+                        )
+                    else:
+                        new_rId = new_slide.part.relate_to(
+                            rel.target_part, rel.reltype
+                        )
                     rId_map[rId] = new_rId
-                else:
-                    # Copy the part blob (image, video, etc.) into the base presentation
-                    target_part = rel.target_part
-                    new_rId = new_slide.part.relate_to(target_part, rel.reltype)
-                    rId_map[rId] = new_rId
+                except Exception:
+                    pass
 
-            # Deep-copy all shapes from src slide, then rewrite rIds in the XML
+            # Deep-copy shapes and rewrite rIds in XML
             spTree = new_slide.shapes._spTree
             for shape in src_slide.shapes:
                 el_copy = copy.deepcopy(shape._element)
-                # Rewrite all r:id / r:embed attributes to use the new rIds
                 _rewrite_rids(el_copy, rId_map)
                 spTree.append(el_copy)
 
-        # Save after each source PPTX and reload to free memory
-        base_prs.save(output_path)
         del src_prs
-        base_prs = Presentation(output_path)
 
+    # Save once — no intermediate reloads
     base_prs.save(output_path)
-
-
-def _rewrite_rids(element, rId_map):
-    """
-    Recursively rewrite r:id, r:embed, and r:link attributes
-    in a copied XML element tree using the rId remapping dict.
-    """
-    NSMAP = {
-        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-    }
-    # Attributes that hold relationship IDs
-    rId_attrs = [
-        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id',
-        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
-        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link',
-    ]
-    for attr in rId_attrs:
-        if attr in element.attrib:
-            old_rId = element.attrib[attr]
-            if old_rId in rId_map:
-                element.attrib[attr] = rId_map[old_rId]
-    for child in element:
-        _rewrite_rids(child, rId_map)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -206,10 +186,6 @@ def health():
 
 @app.route('/merge', methods=['POST'])
 def merge():
-    """
-    Merge multiple PPTX files into one and return as binary download.
-    Body: { "urls": [...] }  or  { "files": ["base64", ...] }
-    """
     data = request.get_json()
     if not data:
         return jsonify({'error': 'No JSON body provided'}), 400
@@ -261,22 +237,6 @@ def merge():
 
 @app.route('/merge-and-upload', methods=['POST'])
 def merge_and_upload():
-    """
-    Merge multiple PPTX files and upload directly to OneDrive.
-
-    Body:
-    {
-      "urls":     ["https://...", ...],
-      "filename": "My Course.pptx"
-    }
-
-    Returns:
-    {
-      "status":   "uploaded",
-      "filename": "My Course.pptx",
-      "web_url":  "https://onedrive.live.com/..."
-    }
-    """
     data = request.get_json()
     if not data:
         return jsonify({'error': 'No JSON body provided'}), 400
@@ -290,7 +250,6 @@ def merge_and_upload():
     if not folder_id:
         return jsonify({'error': 'ONEDRIVE_FOLDER_ID environment variable not set'}), 500
 
-    # Sanitize filename — remove characters invalid in OneDrive and Graph API URLs
     filename = sanitize_filename(raw_name)
     if not filename.lower().endswith('.pptx'):
         filename += '.pptx'
@@ -299,7 +258,6 @@ def merge_and_upload():
     pptx_paths = []
 
     try:
-        # Step 1 — Download all PPTX parts from Gamma
         for i, url in enumerate(urls):
             dest = os.path.join(work_dir, f'part{i+1}.pptx')
             try:
@@ -311,17 +269,14 @@ def merge_and_upload():
         if not pptx_paths:
             return jsonify({'error': 'No valid PPTX files to merge'}), 400
 
-        # Step 2 — Merge into one file on disk with correct image handling
         output_path = os.path.join(work_dir, filename)
         merge_pptx_files(pptx_paths, output_path)
 
-        # Step 3 — Get fresh OneDrive access token
         try:
             access_token = get_onedrive_access_token()
         except Exception as e:
             return jsonify({'error': 'Failed to get OneDrive access token', 'details': str(e)}), 500
 
-        # Step 4 — Upload directly to OneDrive via chunked upload session
         try:
             web_url = upload_to_onedrive(output_path, filename, folder_id, access_token)
         except Exception as e:
