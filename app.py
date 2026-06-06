@@ -10,6 +10,23 @@ import copy
 
 app = Flask(__name__)
 
+# Relationship types owned by the slide layout/master — skip these entirely.
+# python-pptx sets them automatically when a new slide is added.
+SKIP_RELTYPES = {
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout',
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster',
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme',
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/themeOverride',
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide',
+}
+
+# rId XML attributes to rewrite after copying shapes
+RID_ATTRS = [
+    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id',
+    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
+    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link',
+]
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def sanitize_filename(name):
@@ -17,6 +34,25 @@ def sanitize_filename(name):
     name = re.sub(r'[<>:"/\\|?*&]', '-', name)
     name = re.sub(r'-+', '-', name)
     return name.strip('-')
+
+
+def _rewrite_rids(element, rId_map):
+    """Recursively rewrite rId attributes in a copied XML element."""
+    for attr in RID_ATTRS:
+        if attr in element.attrib:
+            old = element.attrib[attr]
+            if old in rId_map:
+                element.attrib[attr] = rId_map[old]
+    for child in element:
+        _rewrite_rids(child, rId_map)
+
+
+def _has_failed_rid(element, failed_rIds):
+    """Return True if element or any descendant references a failed rId."""
+    for attr in RID_ATTRS:
+        if element.attrib.get(attr) in failed_rIds:
+            return True
+    return any(_has_failed_rid(child, failed_rIds) for child in element)
 
 
 # ── OneDrive helpers ──────────────────────────────────────────────────────────
@@ -103,27 +139,16 @@ def download_file(url, dest_path):
         f.write(response.content)
 
 
-def _rewrite_rids(element, rId_map):
-    """Recursively rewrite r:id, r:embed, r:link attributes using rId_map."""
-    rId_attrs = [
-        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id',
-        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
-        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link',
-    ]
-    for attr in rId_attrs:
-        if attr in element.attrib:
-            old = element.attrib[attr]
-            if old in rId_map:
-                element.attrib[attr] = rId_map[old]
-    for child in element:
-        _rewrite_rids(child, rId_map)
-
-
 def merge_pptx_files(pptx_paths, output_path):
     """
-    Merge multiple PPTX files preserving images.
-    Loads base from pptx_paths[0], appends all slides from subsequent files,
-    saves once at the end. No intermediate reload to avoid corruption.
+    Merge multiple PPTX files preserving images and media.
+
+    For each source slide:
+    - Skip layout/master/theme rels (auto-managed by python-pptx)
+    - Copy all content rels (images, media, hyperlinks) with rId remapping
+    - Track failed rels — drop any shape referencing a failed rId rather
+      than inserting broken XML that triggers PowerPoint's repair prompt
+    - Save once at the end — no intermediate reloads
     """
     if len(pptx_paths) == 1:
         shutil.copy(pptx_paths[0], output_path)
@@ -135,7 +160,7 @@ def merge_pptx_files(pptx_paths, output_path):
         src_prs = Presentation(pptx_path)
 
         for src_slide in src_prs.slides:
-            # Add blank slide to base
+            # Add a blank slide to base presentation
             blank_layout = (
                 base_prs.slide_layouts[6]
                 if len(base_prs.slide_layouts) > 6
@@ -143,14 +168,18 @@ def merge_pptx_files(pptx_paths, output_path):
             )
             new_slide = base_prs.slides.add_slide(blank_layout)
 
-            # Remove placeholder shapes from blank layout
+            # Remove placeholder shapes from the blank layout
             for shape in list(new_slide.placeholders):
                 sp = shape._element
                 sp.getparent().remove(sp)
 
-            # Copy all relationships from src slide → new slide, build rId map
-            rId_map = {}
+            # Copy content relationships, track any that fail
+            rId_map    = {}
+            failed_rIds = set()
+
             for rId, rel in src_slide.part.rels.items():
+                if rel.reltype in SKIP_RELTYPES:
+                    continue
                 try:
                     if rel.is_external:
                         new_rId = new_slide.part.relate_to(
@@ -162,18 +191,21 @@ def merge_pptx_files(pptx_paths, output_path):
                         )
                     rId_map[rId] = new_rId
                 except Exception:
-                    pass
+                    failed_rIds.add(rId)
 
-            # Deep-copy shapes and rewrite rIds in XML
+            # Deep-copy shapes — drop any shape referencing a failed rId
+            # to prevent broken XML from triggering PowerPoint repair prompt
             spTree = new_slide.shapes._spTree
             for shape in src_slide.shapes:
                 el_copy = copy.deepcopy(shape._element)
+                if failed_rIds and _has_failed_rid(el_copy, failed_rIds):
+                    continue
                 _rewrite_rids(el_copy, rId_map)
                 spTree.append(el_copy)
 
         del src_prs
 
-    # Save once — no intermediate reloads
+    # Single save — no intermediate reloads
     base_prs.save(output_path)
 
 
