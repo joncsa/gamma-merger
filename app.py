@@ -6,6 +6,8 @@ import tempfile
 import shutil
 from flask import Flask, request, jsonify, send_file
 from pptx import Presentation
+from pptx.util import Emu
+from lxml import etree
 import copy
 
 app = Flask(__name__)
@@ -41,7 +43,6 @@ def get_onedrive_access_token():
     response.raise_for_status()
     token_data = response.json()
 
-    # Persist the new refresh token back to the environment so it stays fresh
     if 'refresh_token' in token_data:
         os.environ['ONEDRIVE_REFRESH_TOKEN'] = token_data['refresh_token']
 
@@ -51,12 +52,10 @@ def get_onedrive_access_token():
 def upload_to_onedrive(file_path, filename, folder_id, access_token):
     """
     Upload a file to OneDrive using the resumable (chunked) upload session.
-    Handles files of any size — no memory bottleneck.
     Returns the OneDrive web URL of the uploaded file.
     """
     CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB chunks
 
-    # Create an upload session
     create_session_url = (
         f'https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}:/{filename}:/createUploadSession'
     )
@@ -77,7 +76,6 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
     session_response.raise_for_status()
     upload_url = session_response.json()['uploadUrl']
 
-    # Upload in chunks
     file_size = os.path.getsize(file_path)
     uploaded  = 0
 
@@ -98,7 +96,6 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
                 timeout=120
             )
 
-            # 202 = still uploading, 200/201 = complete
             if chunk_response.status_code not in (200, 201, 202):
                 chunk_response.raise_for_status()
 
@@ -119,7 +116,11 @@ def download_file(url, dest_path):
 
 
 def merge_pptx_files(pptx_paths, output_path):
-    """Merge multiple PPTX files into one using python-pptx, sequentially."""
+    """
+    Merge multiple PPTX files into one using python-pptx.
+    Correctly copies image/media parts and remaps relationship IDs
+    so images are not broken in the merged output.
+    """
     if len(pptx_paths) == 1:
         shutil.copy(pptx_paths[0], output_path)
         return
@@ -128,25 +129,72 @@ def merge_pptx_files(pptx_paths, output_path):
 
     for pptx_path in pptx_paths[1:]:
         src_prs = Presentation(pptx_path)
-        for slide in src_prs.slides:
+
+        for src_slide in src_prs.slides:
+            # Add a blank slide to the base presentation
             blank_layout = (
                 base_prs.slide_layouts[6]
                 if len(base_prs.slide_layouts) > 6
                 else base_prs.slide_layouts[0]
             )
             new_slide = base_prs.slides.add_slide(blank_layout)
+
+            # Remove any placeholder shapes from the blank layout
             for shape in list(new_slide.placeholders):
                 sp = shape._element
                 sp.getparent().remove(sp)
-            for shape in slide.shapes:
+
+            # Build a rId remap: src rId → new rId in base_prs
+            rId_map = {}
+
+            for rId, rel in src_slide.part.rels.items():
+                if rel.is_external:
+                    # Copy external hyperlinks as-is
+                    new_rId = new_slide.part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+                    rId_map[rId] = new_rId
+                else:
+                    # Copy the part blob (image, video, etc.) into the base presentation
+                    target_part = rel.target_part
+                    new_rId = new_slide.part.relate_to(target_part, rel.reltype)
+                    rId_map[rId] = new_rId
+
+            # Deep-copy all shapes from src slide, then rewrite rIds in the XML
+            spTree = new_slide.shapes._spTree
+            for shape in src_slide.shapes:
                 el_copy = copy.deepcopy(shape._element)
-                new_slide.shapes._spTree.append(el_copy)
-        # Save after each merge and reload to free memory
+                # Rewrite all r:id / r:embed attributes to use the new rIds
+                _rewrite_rids(el_copy, rId_map)
+                spTree.append(el_copy)
+
+        # Save after each source PPTX and reload to free memory
         base_prs.save(output_path)
         del src_prs
         base_prs = Presentation(output_path)
 
     base_prs.save(output_path)
+
+
+def _rewrite_rids(element, rId_map):
+    """
+    Recursively rewrite r:id, r:embed, and r:link attributes
+    in a copied XML element tree using the rId remapping dict.
+    """
+    NSMAP = {
+        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    }
+    # Attributes that hold relationship IDs
+    rId_attrs = [
+        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id',
+        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
+        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link',
+    ]
+    for attr in rId_attrs:
+        if attr in element.attrib:
+            old_rId = element.attrib[attr]
+            if old_rId in rId_map:
+                element.attrib[attr] = rId_map[old_rId]
+    for child in element:
+        _rewrite_rids(child, rId_map)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -215,12 +263,11 @@ def merge():
 def merge_and_upload():
     """
     Merge multiple PPTX files and upload directly to OneDrive.
-    No large binary is ever passed through n8n memory.
 
     Body:
     {
-      "urls":     ["https://...", ...],   // Gamma export URLs
-      "filename": "My Course.pptx"        // Desired filename in OneDrive
+      "urls":     ["https://...", ...],
+      "filename": "My Course.pptx"
     }
 
     Returns:
@@ -264,7 +311,7 @@ def merge_and_upload():
         if not pptx_paths:
             return jsonify({'error': 'No valid PPTX files to merge'}), 400
 
-        # Step 2 — Merge into one file on disk
+        # Step 2 — Merge into one file on disk with correct image handling
         output_path = os.path.join(work_dir, filename)
         merge_pptx_files(pptx_paths, output_path)
 
