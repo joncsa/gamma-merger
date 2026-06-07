@@ -4,55 +4,40 @@ import base64
 import requests
 import tempfile
 import shutil
+import zipfile
 from flask import Flask, request, jsonify, send_file
-from pptx import Presentation
-import copy
+from lxml import etree
 
 app = Flask(__name__)
 
-# Relationship types owned by the slide layout/master — skip these entirely.
-# python-pptx sets them automatically when a new slide is added.
-SKIP_RELTYPES = {
-    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout',
-    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster',
-    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme',
-    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/themeOverride',
-    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide',
-}
+# XML namespaces
+NS_RELS      = 'http://schemas.openxmlformats.org/package/2006/relationships'
+NS_CT        = 'http://schemas.openxmlformats.org/package/2006/content-types'
+NS_PRES      = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+NS_R         = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+NS_P         = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 
-# rId XML attributes to rewrite after copying shapes
-RID_ATTRS = [
-    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id',
-    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
-    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link',
-]
+SLIDE_CONTENT_TYPE  = 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml'
+SLIDE_REL_TYPE      = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide'
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def sanitize_filename(name):
-    """Remove characters invalid in OneDrive filenames and Graph API URLs."""
     name = re.sub(r'[<>:"/\\|?*&]', '-', name)
     name = re.sub(r'-+', '-', name)
     return name.strip('-')
 
 
-def _rewrite_rids(element, rId_map):
-    """Recursively rewrite rId attributes in a copied XML element."""
-    for attr in RID_ATTRS:
-        if attr in element.attrib:
-            old = element.attrib[attr]
-            if old in rId_map:
-                element.attrib[attr] = rId_map[old]
-    for child in element:
-        _rewrite_rids(child, rId_map)
+def get_xml(zf, path):
+    """Read and parse an XML file from a ZIP."""
+    with zf.open(path) as f:
+        return etree.parse(f).getroot()
 
 
-def _has_failed_rid(element, failed_rIds):
-    """Return True if element or any descendant references a failed rId."""
-    for attr in RID_ATTRS:
-        if element.attrib.get(attr) in failed_rIds:
-            return True
-    return any(_has_failed_rid(child, failed_rIds) for child in element)
+def set_xml(zf_out, path, root):
+    """Write an XML element tree to a ZIP entry."""
+    zf_out.writestr(path, etree.tostring(root, xml_declaration=True,
+                                          encoding='UTF-8', standalone=True))
 
 
 # ── OneDrive helpers ──────────────────────────────────────────────────────────
@@ -92,12 +77,7 @@ def upload_to_onedrive(file_path, filename, folder_id, access_token):
             'Authorization': f'Bearer {access_token}',
             'Content-Type':  'application/json',
         },
-        json={
-            'item': {
-                '@microsoft.graph.conflictBehavior': 'rename',
-                'name': filename,
-            }
-        },
+        json={'item': {'@microsoft.graph.conflictBehavior': 'rename', 'name': filename}},
         timeout=30
     )
     session_response.raise_for_status()
@@ -141,72 +121,242 @@ def download_file(url, dest_path):
 
 def merge_pptx_files(pptx_paths, output_path):
     """
-    Merge multiple PPTX files preserving images and media.
-
-    For each source slide:
-    - Skip layout/master/theme rels (auto-managed by python-pptx)
-    - Copy all content rels (images, media, hyperlinks) with rId remapping
-    - Track failed rels — drop any shape referencing a failed rId rather
-      than inserting broken XML that triggers PowerPoint's repair prompt
-    - Save once at the end — no intermediate reloads
+    Merge multiple PPTX files at the ZIP/package level.
+    Copies slide XML, rels, and media files directly without touching
+    their contents — preserving all images including SVG exactly as-is.
     """
     if len(pptx_paths) == 1:
         shutil.copy(pptx_paths[0], output_path)
         return
 
-    base_prs = Presentation(pptx_paths[0])
+    # Work on a copy of Part 1 as our base
+    base_path = output_path + '.base.pptx'
+    shutil.copy(pptx_paths[0], base_path)
 
-    for pptx_path in pptx_paths[1:]:
-        src_prs = Presentation(pptx_path)
+    try:
+        for src_path in pptx_paths[1:]:
+            _append_pptx(base_path, src_path)
+        shutil.move(base_path, output_path)
+    except Exception:
+        if os.path.exists(base_path):
+            os.remove(base_path)
+        raise
 
-        for src_slide in src_prs.slides:
-            # Add a blank slide to base presentation
-            blank_layout = (
-                base_prs.slide_layouts[6]
-                if len(base_prs.slide_layouts) > 6
-                else base_prs.slide_layouts[0]
+
+def _append_pptx(base_path, src_path):
+    """
+    Append all slides from src_path into base_path at the package level.
+    Handles filename collisions for slides and media by renaming src entries.
+    """
+    tmp_path = base_path + '.tmp'
+
+    with zipfile.ZipFile(base_path, 'r') as base_zip, \
+         zipfile.ZipFile(src_path,  'r') as src_zip,  \
+         zipfile.ZipFile(tmp_path,  'w', zipfile.ZIP_DEFLATED) as out_zip:
+
+        base_names = set(base_zip.namelist())
+        src_names  = set(src_zip.namelist())
+
+        # ── 1. Determine existing slide count in base ──────────────────────
+        base_slides = sorted([
+            n for n in base_names
+            if re.match(r'ppt/slides/slide\d+\.xml$', n)
+        ], key=lambda x: int(re.search(r'\d+', x.split('/')[-1]).group()))
+        base_slide_count = len(base_slides)
+
+        # ── 2. Enumerate slides in src ─────────────────────────────────────
+        src_slides = sorted([
+            n for n in src_names
+            if re.match(r'ppt/slides/slide\d+\.xml$', n)
+        ], key=lambda x: int(re.search(r'\d+', x.split('/')[-1]).group()))
+
+        # ── 3. Build media rename map to avoid collisions ──────────────────
+        # e.g. ppt/media/image-1-1.png → ppt/media/image-1-1_src.png if collision
+        media_rename = {}
+        for name in src_names:
+            if name.startswith('ppt/media/'):
+                if name in base_names:
+                    # Rename: insert '_s{N}' before extension
+                    base_n, ext = os.path.splitext(name)
+                    new_name = base_n + '_s' + str(base_slide_count) + ext
+                    media_rename[name] = new_name
+                else:
+                    media_rename[name] = name
+
+        # ── 4. Build slide rename map ──────────────────────────────────────
+        slide_rename = {}
+        for i, slide_name in enumerate(src_slides):
+            new_num = base_slide_count + i + 1
+            new_slide_name = f'ppt/slides/slide{new_num}.xml'
+            slide_rename[slide_name] = new_slide_name
+            # Also map the .rels file
+            old_rels = slide_name.replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels'
+            new_rels = new_slide_name.replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels'
+            slide_rename[old_rels] = new_rels
+
+        # ── 5. Copy all base files into output ─────────────────────────────
+        for name in base_names:
+            if name in ('ppt/presentation.xml',
+                        'ppt/_rels/presentation.xml.rels',
+                        '[Content_Types].xml'):
+                continue  # Handle these separately
+            out_zip.writestr(name, base_zip.read(name))
+
+        # ── 6. Copy src files into output (with renames) ───────────────────
+        skip_src = {
+            'ppt/presentation.xml',
+            'ppt/_rels/presentation.xml.rels',
+            '[Content_Types].xml',
+            '_rels/.rels',
+            'docProps/app.xml',
+            'docProps/core.xml',
+        }
+        for name in src_names:
+            if name in skip_src:
+                continue
+
+            data = src_zip.read(name)
+
+            if name in slide_rename:
+                # It's a slide XML or slide .rels file — rewrite media refs
+                new_name = slide_rename[name]
+                if name.endswith('.rels'):
+                    data = _rewrite_rels(data, media_rename)
+                out_zip.writestr(new_name, data)
+
+            elif name in media_rename:
+                out_zip.writestr(media_rename[name], data)
+
+            elif name.startswith('ppt/slides/'):
+                # Already handled above via slide_rename
+                pass
+
+            elif name.startswith('ppt/media/'):
+                # Already handled above via media_rename
+                pass
+
+            else:
+                # Other src parts (slideLayouts, slideMasters, theme, etc.)
+                # Only copy if not already in base to avoid conflicts
+                if name not in base_names:
+                    out_zip.writestr(name, data)
+
+        # ── 7. Update presentation.xml — add new sldIdLst entries ─────────
+        pres_root = etree.fromstring(base_zip.read('ppt/presentation.xml'))
+        sldIdLst  = pres_root.find(f'{{{NS_P}}}sldIdLst')
+        if sldIdLst is None:
+            sldIdLst = etree.SubElement(pres_root, f'{{{NS_P}}}sldIdLst')
+
+        # Find max existing sldId
+        existing_ids = [
+            int(el.get('id', 0))
+            for el in sldIdLst.findall(f'{{{NS_P}}}sldId')
+        ]
+        max_id = max(existing_ids) if existing_ids else 255
+
+        # Find max existing rId in presentation rels
+        pres_rels_root = etree.fromstring(
+            base_zip.read('ppt/_rels/presentation.xml.rels')
+        )
+        existing_rids = [
+            int(re.sub(r'\D', '', el.get('Id', 'rId0')))
+            for el in pres_rels_root.findall(f'{{{NS_RELS}}}Relationship')
+            if re.sub(r'\D', '', el.get('Id', ''))
+        ]
+        max_rid = max(existing_rids) if existing_rids else 0
+
+        for i, src_slide in enumerate(src_slides):
+            new_num   = base_slide_count + i + 1
+            new_rid   = f'rId{max_rid + new_num}'
+            new_id    = max_id + i + 1
+            new_slide = f'ppt/slides/slide{new_num}.xml'
+
+            # Add sldId entry to presentation.xml
+            sld_id_el = etree.SubElement(sldIdLst, f'{{{NS_P}}}sldId')
+            sld_id_el.set('id',          str(new_id))
+            sld_id_el.set(f'{{{NS_R}}}id', new_rid)
+
+            # Add relationship to presentation.xml.rels
+            rel_el = etree.SubElement(
+                pres_rels_root, f'{{{NS_RELS}}}Relationship'
             )
-            new_slide = base_prs.slides.add_slide(blank_layout)
+            rel_el.set('Id',     new_rid)
+            rel_el.set('Type',   SLIDE_REL_TYPE)
+            rel_el.set('Target', f'slides/slide{new_num}.xml')
 
-            # Remove placeholder shapes from the blank layout
-            for shape in list(new_slide.placeholders):
-                sp = shape._element
-                sp.getparent().remove(sp)
+        out_zip.writestr(
+            'ppt/presentation.xml',
+            etree.tostring(pres_root, xml_declaration=True,
+                           encoding='UTF-8', standalone=True)
+        )
+        out_zip.writestr(
+            'ppt/_rels/presentation.xml.rels',
+            etree.tostring(pres_rels_root, xml_declaration=True,
+                           encoding='UTF-8', standalone=True)
+        )
 
-            # Copy content relationships, track any that fail
-            rId_map    = {}
-            failed_rIds = set()
+        # ── 8. Update [Content_Types].xml ─────────────────────────────────
+        ct_root = etree.fromstring(base_zip.read('[Content_Types].xml'))
 
-            for rId, rel in src_slide.part.rels.items():
-                if rel.reltype in SKIP_RELTYPES:
-                    continue
-                try:
-                    if rel.is_external:
-                        new_rId = new_slide.part.relate_to(
-                            rel.target_ref, rel.reltype, is_external=True
-                        )
-                    else:
-                        new_rId = new_slide.part.relate_to(
-                            rel.target_part, rel.reltype
-                        )
-                    rId_map[rId] = new_rId
-                except Exception:
-                    failed_rIds.add(rId)
+        # Collect existing Override PartNames
+        existing_parts = {
+            el.get('PartName')
+            for el in ct_root.findall(f'{{{NS_CT}}}Override')
+        }
 
-            # Deep-copy shapes — drop any shape referencing a failed rId
-            # to prevent broken XML from triggering PowerPoint repair prompt
-            spTree = new_slide.shapes._spTree
-            for shape in src_slide.shapes:
-                el_copy = copy.deepcopy(shape._element)
-                if failed_rIds and _has_failed_rid(el_copy, failed_rIds):
-                    continue
-                _rewrite_rids(el_copy, rId_map)
-                spTree.append(el_copy)
+        # Add Override entries for new slides
+        for i, src_slide in enumerate(src_slides):
+            new_num  = base_slide_count + i + 1
+            partname = f'/ppt/slides/slide{new_num}.xml'
+            if partname not in existing_parts:
+                el = etree.SubElement(ct_root, f'{{{NS_CT}}}Override')
+                el.set('PartName',    partname)
+                el.set('ContentType', SLIDE_CONTENT_TYPE)
 
-        del src_prs
+        # Add Default entries for any new media extensions (e.g. svg)
+        existing_exts = {
+            el.get('Extension')
+            for el in ct_root.findall(f'{{{NS_CT}}}Default')
+        }
+        svg_content_type = 'image/svg+xml'
+        if 'svg' not in existing_exts:
+            # Check if any src media is svg
+            has_svg = any(
+                n.lower().endswith('.svg')
+                for n in src_names
+                if n.startswith('ppt/media/')
+            )
+            if has_svg:
+                el = etree.SubElement(ct_root, f'{{{NS_CT}}}Default')
+                el.set('Extension',   'svg')
+                el.set('ContentType', svg_content_type)
 
-    # Single save — no intermediate reloads
-    base_prs.save(output_path)
+        out_zip.writestr(
+            '[Content_Types].xml',
+            etree.tostring(ct_root, xml_declaration=True,
+                           encoding='UTF-8', standalone=True)
+        )
+
+    # Replace base with tmp
+    os.replace(tmp_path, base_path)
+
+
+def _rewrite_rels(data, media_rename):
+    """
+    Rewrite Target attributes in a slide .rels file
+    to reflect renamed media files.
+    """
+    root = etree.fromstring(data)
+    for rel in root.findall(f'{{{NS_RELS}}}Relationship'):
+        target = rel.get('Target', '')
+        # Target is relative like ../media/image-1-1.png
+        # Resolve to full path for lookup
+        full = 'ppt/media/' + target.split('../media/')[-1]
+        if full in media_rename and media_rename[full] != full:
+            new_basename = os.path.basename(media_rename[full])
+            rel.set('Target', '../media/' + new_basename)
+    return etree.tostring(root, xml_declaration=True,
+                          encoding='UTF-8', standalone=True)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
