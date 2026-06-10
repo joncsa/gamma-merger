@@ -475,7 +475,60 @@ def merge_and_upload():
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+@app.route('/generate-docx', methods=['POST'])
+def generate_docx():
+    from docx import Document as DocxDocument
+    from docx.shared import Pt
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No JSON body provided'}), 400
 
+    content   = data.get('content', '')
+    raw_name  = data.get('filename', 'output.docx')
+    folder_id = os.environ.get('ONEDRIVE_FOLDER_ID', '')
+
+    if not content:
+        return jsonify({'error': 'content is required'}), 400
+    if not folder_id:
+        return jsonify({'error': 'ONEDRIVE_FOLDER_ID not set'}), 500
+
+    filename = sanitize_filename(raw_name)
+    if not filename.lower().endswith('.docx'):
+        filename += '.docx'
+
+    work_dir = tempfile.mkdtemp()
+    try:
+        doc = DocxDocument()
+        for line in content.split('\n'):
+            para = doc.add_paragraph()
+            run  = para.add_run(line)
+            run.font.size = Pt(11)
+
+        output_path = os.path.join(work_dir, filename)
+        doc.save(output_path)
+
+        try:
+            access_token = get_onedrive_access_token()
+        except Exception as e:
+            return jsonify({'error': 'Failed to get OneDrive token', 'details': str(e)}), 500
+
+        try:
+            web_url = upload_to_onedrive(output_path, filename, folder_id, access_token)
+        except Exception as e:
+            return jsonify({'error': 'Failed to upload to OneDrive', 'details': str(e)}), 500
+
+        return jsonify({
+            'status':   'uploaded',
+            'filename': filename,
+            'web_url':  web_url,
+        })
+
+    except Exception as e:
+        return jsonify({'error': 'generate-docx failed', 'details': str(e)}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
